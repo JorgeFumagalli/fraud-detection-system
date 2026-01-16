@@ -17,6 +17,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 
+import tensorflow as tf
+from tensorflow.keras import layers, callbacks, regularizers
+
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
@@ -217,7 +220,7 @@ X_test_scaled  = scaler.transform(X_test)
 results, models, model_probs = {}, {}, {}
 
 # 1) Logistic Regression
-print("\n[1/4] Training Logistic Regression…")
+print("\n[1/5] Training Logistic Regression…")
 lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=RANDOM_STATE)
 lr.fit(X_train_scaled, y_train)
 lr_prob = lr.predict_proba(X_test_scaled)[:, 1]
@@ -227,7 +230,7 @@ models['lr'] = lr
 print(f"   ✓ AUC={results['Logistic Regression']['AUC']:.4f}")
 
 # 2) Random Forest (Bayesian Optimization)
-print("[2/4] Training Random Forest (BayesSearchCV)…")
+print("[2/5] Training Random Forest (BayesSearchCV)…")
 search_spaces = {'n_estimators': Integer(200, 800), 'max_depth': Integer(4, 20)}
 bayes_rf = BayesSearchCV(
     RandomForestClassifier(class_weight='balanced', n_jobs=-1, random_state=RANDOM_STATE),
@@ -243,7 +246,7 @@ models['rf'] = rf_best
 print(f"   ✓ AUC={results['Random Forest']['AUC']:.4f}, Params={bayes_rf.best_params_}")
 
 # 3) XGBoost
-print("[3/4] Training XGBoost…")
+print("[3/5] Training XGBoost…")
 xgb_model = XGBClassifier(
     n_estimators=500, max_depth=6, learning_rate=0.05,
     subsample=0.8, colsample_bytree=0.8,
@@ -258,16 +261,68 @@ models['xgb'] = xgb_model
 print(f"   ✓ AUC={results['XGBoost']['AUC']:.4f}")
 
 # 4) MLP
-print("[4/4] Training MLP Classifier…")
-mlp = MLPClassifier(hidden_layer_sizes=(64, 32), activation='relu', solver='adam',
-                    alpha=1e-3, max_iter=150, random_state=RANDOM_STATE,
-                    early_stopping=True)
+print("[4/5] Training MLP Classifier…")
+mlp = MLPClassifier(hidden_layer_sizes=(128, 64), activation='relu', 
+                    solver='adam', alpha=1e-4, batch_size=64, 
+                    learning_rate_init=1e-3,   max_iter=500, 
+                    early_stopping=True, validation_fraction=0.15,
+                    n_iter_no_change=20, tol=1e-4, random_state=RANDOM_STATE)
 mlp.fit(X_train_scaled, y_train)
 mlp_prob = mlp.predict_proba(X_test_scaled)[:, 1]
 results['MLP'] = {'AUC': roc_auc_score(y_test, mlp_prob)}
 model_probs['MLP'] = mlp_prob
 models['mlp'] = mlp
 print(f"   ✓ AUC={results['MLP']['AUC']:.4f}")
+
+print("[5/5] Training LSTM Classifier…")
+
+X_train_seq = X_train_scaled.reshape(X_train_scaled.shape[0], 1, X_train_scaled.shape[1])
+X_test_seq  = X_test_scaled.reshape(X_test_scaled.shape[0], 1, X_test_scaled.shape[1])
+
+tf.keras.utils.set_random_seed(RANDOM_STATE)
+
+model = tf.keras.Sequential([
+    layers.Input(shape=(1, X_train_scaled.shape[1])),
+    layers.LSTM(
+        64,
+        return_sequences=False,
+        dropout=0.2,
+        recurrent_dropout=0.0,
+        kernel_regularizer=regularizers.l2(1e-5)
+    ),
+    layers.BatchNormalization(),
+    layers.Dense(64, activation="relu", kernel_regularizer=regularizers.l2(1e-5)),
+    layers.Dropout(0.3),
+    layers.Dense(1, activation="sigmoid")
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+    loss="binary_crossentropy",
+    metrics=[tf.keras.metrics.AUC(name="auc")]
+)
+
+cbs = [
+    callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=15, restore_best_weights=True),
+    callbacks.ReduceLROnPlateau(monitor="val_auc", mode="max", patience=6, factor=0.5, min_lr=1e-5)
+]
+
+history = model.fit(
+    X_train_seq, y_train,
+    validation_split=0.15,
+    epochs=120,
+    batch_size=64,
+    callbacks=cbs,
+    verbose=0
+)
+
+lstm_prob = model.predict(X_test_seq, verbose=0).ravel()
+
+results['LSTM'] = {'AUC': roc_auc_score(y_test, lstm_prob)}
+model_probs['LSTM'] = lstm_prob
+models['lstm'] = model
+
+print(f"   ✓ AUC={results['LSTM']['AUC']:.4f}")
 
 print("\n✅ All models trained successfully.")
 
@@ -314,6 +369,7 @@ model_list = [
     ('Random Forest',        model_probs['RF']),
     ('XGBoost',              model_probs['XGB']),
     ('MLP',                  model_probs['MLP']),
+    ('LSTM',                model_probs['LSTM'])
 ]
 
 for name, probs in model_list:
@@ -351,7 +407,7 @@ cost_curves = {name: [calc_cost(cm, r) for r in r_values] for name, cm in cms.it
 # Plot curves
 plt.figure(figsize=(12, 7))
 palette = {'Logistic Regression': '#1f77b4', 'Random Forest': '#ff7f0e',
-           'XGBoost': '#2ca02c', 'MLP': '#d62728'}
+           'XGBoost': '#2ca02c', 'MLP': '#d62728', 'LSTM':  '#993399'}
 for name, costs in cost_curves.items():
     plt.plot(r_values, costs, label=name, lw=2.2, color=palette[name], alpha=0.9)
 plt.axvline(0.74, color='k', ls=':', lw=1)
